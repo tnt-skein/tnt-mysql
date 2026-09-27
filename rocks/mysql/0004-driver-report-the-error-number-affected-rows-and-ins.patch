@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Sat, 19 Sep 2026 13:00:00 +0300
+Subject: [PATCH 4/7] driver: report the error number, affected rows and insert
+ id
+
+An error lost its number: the caller could tell a deadlock (1213)
+from a syntax error (1064) and a wrong password (1045) from a closed
+port (2002) only by the English text, or by SHOW WARNINGS as the next
+query. Now the driver returns the number as the third value, and
+connect and execute raise box.error of type MySQLError with the field
+mysql_errno (the field errno of box.error is taken by the system
+errno). Errors without a number - a cancelled fiber, a Lua error of
+the driver - stay plain strings, as before.
+
+On success execute returns two more values: the number of rows the
+last statement affected (mysql_affected_rows, nil if the server
+reported none, as for SELECT) and the value it generated for an
+AUTO_INCREMENT column (mysql_insert_id, 0 if none), both as uint64.
+The caller no longer needs 'select row_count(), last_insert_id()' as
+a second query, and the value is the one of this very statement:
+last_insert_id() keeps the value of an earlier insert.
+---
+ mysql/driver.c | 80 +++++++++++++++++++++++++++++++++++++++++++++-----
+ mysql/init.lua | 46 +++++++++++++++++++++--------
+ 2 files changed, 106 insertions(+), 20 deletions(-)
+
+diff --git a/mysql/driver.c b/mysql/driver.c
+index f7d835f..a55b28f 100755
+--- a/mysql/driver.c
++++ b/mysql/driver.c
+@@ -155,13 +155,16 @@ lua_push_error(struct lua_State *L)
+ 	return 2;
+ }
+ 
+-/* Push connection status and error message to lua stack.
+- * Status is -1 if connection is dead or 0 if it is still alive
++/*
++ * Push the connection status, the error message and the error
++ * number. Status is -1 if connection is dead or 1 if it is still
++ * alive. The number tells a deadlock (1213) from a syntax error
++ * (1064) without parsing the text; nil if there is none.
+  */
+ static int
+-lua_mysql_push_error(struct lua_State *L, MYSQL *raw_conn)
++lua_mysql_push_error_of(struct lua_State *L, unsigned int err,
++			const char *message)
+ {
+-	int err = mysql_errno(raw_conn);
+ 	switch (err) {
+ 	case CR_SERVER_LOST:
+ 	case CR_SERVER_GONE_ERROR:
+@@ -170,7 +173,49 @@ lua_mysql_push_error(struct lua_State *L, MYSQL *raw_conn)
+ 	default:
+ 		lua_pushnumber(L, 1);
+ 	}
+-	safe_pushstring(L, (char *) mysql_error(raw_conn));
++	safe_pushstring(L, (char *) message);
++	if (err != 0)
++		lua_pushinteger(L, err);
++	else
++		lua_pushnil(L);
++	return 3;
++}
++
++static int
++lua_mysql_push_error(struct lua_State *L, MYSQL *raw_conn)
++{
++	return lua_mysql_push_error_of(L, mysql_errno(raw_conn),
++				       mysql_error(raw_conn));
++}
++
++/*
++ * The error of a prepared statement lives in the statement: a
++ * failed fetch does not copy it to the connection.
++ */
++static int
++lua_mysql_push_stmt_error(struct lua_State *L, MYSQL *raw_conn,
++			  MYSQL_STMT *stmt)
++{
++	if (stmt == NULL || mysql_stmt_errno(stmt) == 0)
++		return lua_mysql_push_error(L, raw_conn);
++	return lua_mysql_push_error_of(L, mysql_stmt_errno(stmt),
++				       mysql_stmt_error(stmt));
++}
++
++/*
++ * Push the number of rows the statement affected and the value it
++ * generated for an AUTO_INCREMENT column, as uint64: nil for the
++ * count if the server reported none.
++ */
++static int
++lua_mysql_push_counts(struct lua_State *L, my_ulonglong affected,
++		      my_ulonglong insert_id)
++{
++	if (affected == (my_ulonglong) ~0)
++		lua_pushnil(L);
++	else
++		luaL_pushuint64(L, affected);
++	luaL_pushuint64(L, insert_id);
+ 	return 2;
+ }
+ 
+@@ -344,6 +389,8 @@ lua_mysql_execute(struct lua_State *L)
+ 	lua_pushnumber(L, 0);
+ 	int ret_count = 2;
+ 	int result_no = 0;
++	my_ulonglong affected = (my_ulonglong) ~0;
++	my_ulonglong insert_id = 0;
+ 
+ 	lua_newtable(L);
+ 	while (true) {
+@@ -371,11 +418,14 @@ lua_mysql_execute(struct lua_State *L)
+ 			}
+ 			lua_settable(L, -3);
+ 		}
++		/* The counts of the last statement are reported. */
++		affected = mysql_affected_rows(raw_conn);
++		insert_id = mysql_insert_id(raw_conn);
+ 		int next_res = mysql_next_result(raw_conn);
+ 		if (next_res < 0)
+ 			break;
+ 	}
+-	return ret_count;
++	return ret_count + lua_mysql_push_counts(L, affected, insert_id);
+ }
+ 
+ /*
+@@ -412,6 +462,8 @@ lua_mysql_execute_prepared(struct lua_State *L)
+ 	size_t len;
+ 	const char *sql = lua_tolstring(L, 2, &len);
+ 	int ret_count = 0, fail = 0, error = 0;
++	my_ulonglong affected = (my_ulonglong) ~0;
++	my_ulonglong insert_id = 0;
+ 
+ 	MYSQL_STMT *stmt = NULL;
+ 	MYSQL_RES *meta = NULL;
+@@ -472,6 +524,8 @@ lua_mysql_execute_prepared(struct lua_State *L)
+ 	error = mysql_stmt_execute(stmt);
+ 	if (error)
+ 		goto done;
++	affected = mysql_stmt_affected_rows(stmt);
++	insert_id = mysql_stmt_insert_id(stmt);
+ 
+ 	meta = mysql_stmt_result_metadata(stmt);
+ 	if (!meta)
+@@ -514,7 +568,9 @@ lua_mysql_execute_prepared(struct lua_State *L)
+ 
+ done:
+ 	if (error)
+-		ret_count = lua_mysql_push_error(L, conn->raw_conn);
++		ret_count = lua_mysql_push_stmt_error(L, conn->raw_conn, stmt);
++	else if (!fail)
++		ret_count += lua_mysql_push_counts(L, affected, insert_id);
+ 	if (values)
+ 		free(values);
+ 	if (param_binds)
+@@ -671,8 +727,16 @@ lua_mysql_connect(struct lua_State *L)
+ 		lua_pushinteger(L, -1);
+ 		int fail = safe_pushstring(L,
+ 			(char *) mysql_error(tmp_raw_conn));
++		unsigned int err = mysql_errno(tmp_raw_conn);
+ 		mysql_close(tmp_raw_conn);
+-		return fail ? lua_push_error(L) : 2;
++		if (fail)
++			return lua_push_error(L);
++		/* The number tells a wrong password from a closed port. */
++		if (err != 0)
++			lua_pushinteger(L, err);
++		else
++			lua_pushnil(L);
++		return 3;
+ 	}
+ 
+ 	lua_pushnumber(L, 0);
+diff --git a/mysql/init.lua b/mysql/init.lua
+index 37b97a5..ebcbe44 100755
+--- a/mysql/init.lua
++++ b/mysql/init.lua
+@@ -14,6 +14,22 @@ local conn_mt
+ -- `get` method returns `nil` when a timeout is reached.
+ local POOL_EMPTY_SLOT = true
+ 
++-- An error the server or the client library reported carries its
++-- number: the caller tells a deadlock (1213) from a syntax error (1064)
++-- and a wrong password (1045) from a closed port (2003) by the code,
++-- not by the text. Errors without a number (a cancelled fiber, a Lua
++-- error of the driver) stay plain strings, as before.
++local function mysql_error(message, errno)
++    if errno == nil then
++        return message
++    end
++    return box.error.new({
++        type = 'MySQLError',
++        reason = message,
++        mysql_errno = errno,
++    })
++end
++
+ --create a new connection
+ local function conn_create(mysql_conn)
+     local queue = fiber.channel(1)
+@@ -51,13 +67,13 @@ local function conn_get(pool, timeout)
+     if mysql_conn == nil then return nil end
+ 
+     if mysql_conn == POOL_EMPTY_SLOT then
+-        local status
+-        status, mysql_conn = driver.connect(pool.host, pool.port or 0,
++        local status, errno
++        status, mysql_conn, errno = driver.connect(pool.host, pool.port or 0,
+                                             pool.user, pool.pass,
+                                             pool.db, pool.use_numeric_result,
+                                             pool.keep_null)
+         if status < 0 then
+-            error(mysql_conn)
++            error(mysql_error(mysql_conn, errno))
+         end
+     end
+ 
+@@ -118,18 +134,23 @@ conn_mt = {
+     __index = {
+         execute = function(self, sql, ...)
+             conn_acquire_lock(self)
+-            local status, datas
++            local status, datas, extra, last_id
+             if select('#', ...) > 0 then
+-                status, datas = self.conn:execute_prepared(sql, ...)
++                status, datas, extra, last_id =
++                    self.conn:execute_prepared(sql, ...)
+             else
+-                status, datas = self.conn:execute(sql)
++                status, datas, extra, last_id = self.conn:execute(sql)
+             end
+             if status ~= 0 then
+                 self.queue:put(status > 0)
+-                error(datas)
++                -- On an error the third value is the error number.
++                error(mysql_error(datas, extra))
+             end
+             self.queue:put(true)
+-            return datas, true
++            -- The number of rows the last statement affected (nil if
++            -- the server reported none) and the value it generated
++            -- for an AUTO_INCREMENT column (0 if none), both uint64.
++            return datas, true, extra, last_id
+         end,
+         begin = function(self)
+             return self:execute('BEGIN') ~= nil
+@@ -179,7 +200,7 @@ local function pool_create(opts)
+     local queue = fiber.channel(opts.size)
+ 
+     for i = 1, opts.size do
+-        local status, conn = driver.connect(opts.host, opts.port or 0,
++        local status, conn, errno = driver.connect(opts.host, opts.port or 0,
+                                             opts.user, opts.password,
+                                             opts.db, opts.use_numeric_result,
+                                             opts.keep_null)
+@@ -188,7 +209,7 @@ local function pool_create(opts)
+                 local mysql_conn = queue:get()
+                 mysql_conn:close()
+             end
+-            error(conn)
++            error(mysql_error(conn, errno))
+         end
+         queue:put(conn)
+     end
+@@ -266,12 +287,13 @@ pool_mt = {
+ local function connect(opts)
+     opts = opts or {}
+ 
+-    local status, mysql_conn = driver.connect(opts.host, opts.port or 0,
++    local status, mysql_conn, errno = driver.connect(opts.host,
++                                              opts.port or 0,
+                                               opts.user, opts.password,
+                                               opts.db, opts.use_numeric_result,
+                                               opts.keep_null)
+     if status < 0 then
+-        error(mysql_conn)
++        error(mysql_error(mysql_conn, errno))
+     end
+     return conn_create(mysql_conn)
+ end

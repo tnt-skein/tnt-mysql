@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Sat, 19 Sep 2026 13:00:00 +0300
+Subject: [PATCH 3/7] driver: read BIGINT UNSIGNED above 2^63 - 1 exactly
+
+A BIGINT value was read with atoll for both signed and unsigned
+columns, and atoll stops at LLONG_MAX: the unsigned
+18446744073709551615 came as 9223372036854775807ULL. An unsigned
+column is read with strtoull now.
+---
+ mysql/driver.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/mysql/driver.c b/mysql/driver.c
+index 2c1e450..f7d835f 100755
+--- a/mysql/driver.c
++++ b/mysql/driver.c
+@@ -227,11 +227,15 @@ lua_mysql_push_value(struct lua_State *L, MYSQL_FIELD *field, void *data,
+ 			break;
+ 
+ 		case MYSQL_TYPE_LONGLONG: {
+-				long long v = atoll(data);
++				/*
++				 * An unsigned value is read as unsigned: atoll
++				 * stops at 2^63 - 1, and 18446744073709551615
++				 * came as 9223372036854775807.
++				 */
+ 				if (field->flags & UNSIGNED_FLAG) {
+-					luaL_pushuint64(L, v);
++					luaL_pushuint64(L, strtoull(data, NULL, 10));
+ 				} else {
+-					luaL_pushint64(L, v);
++					luaL_pushint64(L, strtoll(data, NULL, 10));
+ 				}
+ 				break;
+ 		}

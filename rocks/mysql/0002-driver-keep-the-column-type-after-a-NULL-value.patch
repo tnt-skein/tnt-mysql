@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Sat, 19 Sep 2026 13:00:00 +0300
+Subject: [PATCH 2/7] driver: keep the column type after a NULL value
+
+lua_mysql_push_value marked a NULL value by writing MYSQL_TYPE_NULL
+into the field, and the field is shared by all the rows of the result
+set. After the first NULL in a column every later value of the column
+was read as NULL: 'select 1 union all select null union all select 3'
+returned the rows {a = 1}, {} and {} instead of {a = 1}, {} and
+{a = 3}, on the plain and on the prepared path alike.
+
+The type of the value is decided locally now, and the field stays as
+the server described it.
+---
+ mysql/driver.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/mysql/driver.c b/mysql/driver.c
+index ca84296..2c1e450 100755
+--- a/mysql/driver.c
++++ b/mysql/driver.c
+@@ -198,10 +198,15 @@ lua_mysql_push_value(struct lua_State *L, MYSQL_FIELD *field, void *data,
+ 	 * Field type isn't MYSQL_TYPE_NULL actually in case of
+ 	 * Lua's nil passed as value.
+ 	 * Example: 'conn:execute('SELECT ? AS x', nil)'.
++	 *
++	 * The type is decided here and not written back to the field:
++	 * the field describes the column for every row of the result,
++	 * and a NULL in one row turned all the later values of the
++	 * column into NULL.
+ 	 */
+-	if (data == NULL)
+-		field->type = MYSQL_TYPE_NULL;
+-	switch (field->type) {
++	enum enum_field_types type = data == NULL ? MYSQL_TYPE_NULL :
++		field->type;
++	switch (type) {
+ 		case MYSQL_TYPE_TINY:
+ 		case MYSQL_TYPE_SHORT:
+ 		case MYSQL_TYPE_LONG:

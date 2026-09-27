@@ -1,0 +1,313 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Mon, 28 Sep 2026 22:00:00 +0300
+Subject: [PATCH 11/11] driver: connect with verified TLS and a pinned server
+ public key
+
+connect passes the host, the user, the password and the database to
+the connector and skips every other option silently: ssl and ssl_ca did
+not fail a login, and the connection went in plain text. With
+caching_sha2_password, the default of MySQL 8.4 and 9, a full login on
+a plain connection asks the server for its RSA public key over the same
+connection and encrypts the password with it, so a man in the middle
+who replaces the key reads the password. MariaDB Connector/C 3.4.10,
+built with OpenSSL, can both encrypt the connection and take the key
+from a file (MYSQL_SERVER_PUBLIC_KEY), and the driver used neither.
+
+connect and pool_create take two more options. ssl is TLS with a
+verified certificate of the server: a table with ca, the root the
+certificate is signed with, and cert and key of the client.
+server_public_key is the file of the RSA public key of the server.
+mysql.features tells a driver that takes them from an older one, which
+would skip them silently.
+
+The certificate is always verified, and the root is required.
+Without verification the connector goes on in plain text when the
+server offers no TLS, or when a man in the middle strikes it from the
+greeting, and still takes the connection for a secure one:
+caching_sha2_password then sends the password as it is. Without a root
+a failed verification does not end the login either: the connector
+goes on with a password hash, which only MariaDB 11.4 and newer sign
+after the login, and a server that picks mysql_native_password gets a
+response to the password first. With a root and the verification on,
+a server without TLS is refused: 'SSL is required, but the server does
+not support it'. The name of the host is checked against the
+certificate, except for 127.0.0.1 and ::1.
+
+A key file the connector can not read, a directory included, makes it
+ask the server for the key over the same connection: exactly what the
+file is given to prevent. The driver checks that the file is a regular
+file it can read before it connects and fails with CR_FILE_NOT_FOUND
+otherwise.
+---
+ README.md      |  26 +++++++++++
+ mysql/driver.c | 123 +++++++++++++++++++++++++++++++++++++++++++++++++
+ mysql/init.lua |  18 ++++++--
+ 3 files changed, 164 insertions(+), 3 deletions(-)
+
+diff --git a/README.md b/README.md
+index 72138d3..8f9ae8a 100644
+--- a/README.md
++++ b/README.md
+@@ -80,6 +80,12 @@ pool:put(conn)
+ 
+ ## API Documentation
+ 
++### `mysql.features`
++
++What the driver takes besides the options above: `ssl` and
++`server_public_key` are `true`. An older driver skips unknown options
++silently, and its connection goes plain.
++
+ ### `conn = mysql.connect(opts)`
+ 
+ Connect to a database.
+@@ -95,6 +101,16 @@ Connect to a database.
+    (true/false); default value: false
+  - `keep_null` - provide printing null fields in the result of the
+    "conn:execute" (true/false); default value: false
++ - `ssl` - TLS with a verified certificate of the server: a table with
++   `ca` - the file of the root the certificate is signed with, required, -
++   and `cert`, `key` - the certificate of the client and its key. The name
++   of the host is checked against the certificate, except for 127.0.0.1
++   and ::1, and a server without TLS is refused. Without `ssl` the
++   connection is plain
++ - `server_public_key` - the file of the RSA public key of the server: on a
++   plain connection a full login with `caching_sha2_password` encrypts the
++   password with it rather than with a key the server sends over the same
++   connection. A file that can not be read fails the connection
+ 
+ Throws an error on failure.
+ 
+@@ -243,6 +259,16 @@ Create a connection pool with count of size established connections.
+    (true/false); default value: false
+  - `keep_null` - provide printing null fields in the result of the
+    "conn:execute" (true/false); default value: false
++ - `ssl` - TLS with a verified certificate of the server: a table with
++   `ca` - the file of the root the certificate is signed with, required, -
++   and `cert`, `key` - the certificate of the client and its key. The name
++   of the host is checked against the certificate, except for 127.0.0.1
++   and ::1, and a server without TLS is refused. Without `ssl` the
++   connection is plain
++ - `server_public_key` - the file of the RSA public key of the server: on a
++   plain connection a full login with `caching_sha2_password` encrypts the
++   password with it rather than with a key the server sends over the same
++   connection. A file that can not be read fails the connection
+ 
+ Throws an error on failure.
+ 
+diff --git a/mysql/driver.c b/mysql/driver.c
+index 6e717eb..594e46a 100755
+--- a/mysql/driver.c
++++ b/mysql/driver.c
+@@ -34,6 +34,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <errno.h>
++#include <sys/stat.h>
+ 
+ #include <lua.h>
+ #include <lauxlib.h>
+@@ -801,8 +802,98 @@ mysql_wait_for_io(my_socket socket, my_bool is_read, int timeout)
+ 	return 1;
+ }
+ 
++/*
++ * A path from a field of the ssl table: NULL if there is none.
++ * The string stays alive with the table, an argument of the call.
++ */
++static const char *
++lua_mysql_ssl_path(struct lua_State *L, int index, const char *name)
++{
++	const char *path = NULL;
++	lua_getfield(L, index, name);
++	if (lua_type(L, -1) == LUA_TSTRING)
++		path = lua_tostring(L, -1);
++	else if (!lua_isnil(L, -1))
++		luaL_error(L, "mysql.connect: ssl.%s must be a path", name);
++	lua_pop(L, 1);
++	return path;
++}
++
++/*
++ * Check that the file of the public key of the server can be read.
++ *
++ * The connector reads it only when the server asks for the password,
++ * and a file it can not read, a directory included, makes it ask the
++ * server for the key over the same plain connection: exactly what the
++ * file is given to prevent. So a file that can not be read fails the
++ * connection before it starts.
++ *
++ * Returns 0 if the file can be read, or pushes the status, the message
++ * and the error number of the connection and returns 3.
++ */
++static int
++lua_mysql_check_public_key(struct lua_State *L, const char *path)
++{
++	struct stat st;
++	FILE *file = NULL;
++	int err = 0;
++
++	if (stat(path, &st) != 0)
++		err = errno;
++	else if (!S_ISREG(st.st_mode))
++		err = EISDIR;
++	else if ((file = fopen(path, "r")) == NULL)
++		err = errno;
++	if (file != NULL)
++		fclose(file);
++	if (err == 0)
++		return 0;
++	lua_pushinteger(L, -1);
++	lua_pushfstring(L, "Can't read the server public key file '%s': %s",
++			path, strerror(err));
++	lua_pushinteger(L, CR_FILE_NOT_FOUND);
++	return 3;
++}
++
++/*
++ * Set the options of TLS with a verified certificate of the server.
++ *
++ * The root the certificate is signed with is required, and the
++ * certificate is always verified. Without verification the connector
++ * goes on in plain text when the server offers no TLS, or when a man in
++ * the middle strikes it from the greeting, and still takes the
++ * connection for a secure one: caching_sha2_password sends the
++ * password as it is. Without a root the connector goes on after a
++ * failed verification with a password hash, which MySQL servers never
++ * sign, and hands a response to the password to whoever answered.
++ *
++ * Returns nonzero if an option could not be set.
++ */
++static int
++lua_mysql_set_ssl(MYSQL *raw_conn, const char *ca, const char *cert,
++		  const char *key)
++{
++	my_bool on = 1;
++
++	return mysql_options(raw_conn, MYSQL_OPT_SSL_CA, ca) ||
++	       (cert != NULL &&
++		mysql_options(raw_conn, MYSQL_OPT_SSL_CERT, cert)) ||
++	       (key != NULL &&
++		mysql_options(raw_conn, MYSQL_OPT_SSL_KEY, key)) ||
++	       mysql_options(raw_conn, MYSQL_OPT_SSL_ENFORCE, &on) ||
++	       mysql_options(raw_conn, MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &on);
++}
++
+ /**
+  * connect to MySQL
++ *
++ * The 8th argument is TLS: a table with the root the certificate of
++ * the server is signed with (ca) and optionally the certificate of the
++ * client and its key (cert, key). Without it the connection is plain.
++ * The 9th is the file of the RSA public key of the server: a plain
++ * connection encrypts the password with it on a full login with
++ * caching_sha2_password rather than with a key the server sends over
++ * the same connection, which a man in the middle could replace.
+  */
+ static int
+ lua_mysql_connect(struct lua_State *L)
+@@ -819,6 +910,26 @@ lua_mysql_connect(struct lua_State *L)
+ 	const char *db = lua_tostring(L, 5);
+ 	const int use_numeric_result = lua_toboolean(L, 6);
+ 	const int keep_null = lua_toboolean(L, 7);
++	const int use_ssl = !lua_isnoneornil(L, 8);
++	const char *ssl_ca = NULL, *ssl_cert = NULL, *ssl_key = NULL;
++	const char *public_key = NULL;
++
++	if (use_ssl) {
++		luaL_checktype(L, 8, LUA_TTABLE);
++		ssl_ca = lua_mysql_ssl_path(L, 8, "ca");
++		ssl_cert = lua_mysql_ssl_path(L, 8, "cert");
++		ssl_key = lua_mysql_ssl_path(L, 8, "key");
++		if (ssl_ca == NULL)
++			luaL_error(L, "mysql.connect: ssl.ca is required: "
++				   "the certificate of the server is always "
++				   "verified");
++	}
++	if (!lua_isnoneornil(L, 9)) {
++		public_key = luaL_checkstring(L, 9);
++		int failed = lua_mysql_check_public_key(L, public_key);
++		if (failed)
++			return failed;
++	}
+ 
+ 	MYSQL *raw_conn, *tmp_raw_conn = mysql_init(NULL);
+ 	if (!tmp_raw_conn) {
+@@ -828,6 +939,18 @@ lua_mysql_connect(struct lua_State *L)
+ 		return fail ? lua_push_error(L): 2;
+ 	}
+ 
++	if ((use_ssl &&
++	     lua_mysql_set_ssl(tmp_raw_conn, ssl_ca, ssl_cert, ssl_key)) ||
++	    (public_key != NULL &&
++	     mysql_options(tmp_raw_conn, MYSQL_SERVER_PUBLIC_KEY,
++			   public_key))) {
++		mysql_close(tmp_raw_conn);
++		lua_pushinteger(L, -1);
++		int fail = safe_pushstring(L,
++			"Can not allocate memory for connector options");
++		return fail ? lua_push_error(L): 2;
++	}
++
+ 	int iport = 0;
+ 	const char *usocket = 0;
+ 
+diff --git a/mysql/init.lua b/mysql/init.lua
+index ebcbe44..55f9038 100755
+--- a/mysql/init.lua
++++ b/mysql/init.lua
+@@ -71,7 +71,8 @@ local function conn_get(pool, timeout)
+         status, mysql_conn, errno = driver.connect(pool.host, pool.port or 0,
+                                             pool.user, pool.pass,
+                                             pool.db, pool.use_numeric_result,
+-                                            pool.keep_null)
++                                            pool.keep_null, pool.ssl,
++                                            pool.server_public_key)
+         if status < 0 then
+             error(mysql_error(mysql_conn, errno))
+         end
+@@ -203,7 +204,8 @@ local function pool_create(opts)
+         local status, conn, errno = driver.connect(opts.host, opts.port or 0,
+                                             opts.user, opts.password,
+                                             opts.db, opts.use_numeric_result,
+-                                            opts.keep_null)
++                                            opts.keep_null, opts.ssl,
++                                            opts.server_public_key)
+         if status < 0 then
+             while queue:count() > 0 do
+                 local mysql_conn = queue:get()
+@@ -224,6 +226,8 @@ local function pool_create(opts)
+         size        = opts.size,
+         use_numeric_result = opts.use_numeric_result,
+         keep_null   = opts.keep_null,
++        ssl         = opts.ssl,
++        server_public_key = opts.server_public_key,
+ 
+         -- private variables
+         queue       = queue,
+@@ -291,7 +295,8 @@ local function connect(opts)
+                                               opts.port or 0,
+                                               opts.user, opts.password,
+                                               opts.db, opts.use_numeric_result,
+-                                              opts.keep_null)
++                                              opts.keep_null, opts.ssl,
++                                              opts.server_public_key)
+     if status < 0 then
+         error(mysql_error(mysql_conn, errno))
+     end
+@@ -301,4 +306,11 @@ end
+ return {
+     connect = connect;
+     pool_create = pool_create;
++    -- Unknown options are skipped silently, so a caller asking for TLS
++    -- or a pinned key of the server can not tell a driver without them
++    -- by its answer: the connection would just go plain.
++    features = {
++        ssl = true;
++        server_public_key = true;
++    };
+ }
+-- 
+2.47.3
+

@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Sat, 19 Sep 2026 13:00:00 +0300
+Subject: [PATCH 5/7] driver: report the error of a later statement
+
+The loop over the results of a multi-statement query stopped on any
+non-zero mysql_next_result, and a positive value - the error of the
+next statement - was taken for the end. 'select 1 as a; selec 2'
+returned [[{a = 1}]] without an error, and 'insert (100, 1); insert
+(100, 2)' succeeded with only the first row written. Now the error is
+returned: the earlier statements are done, and the caller must know
+that the rest is not.
+
+A failed mysql_use_result of a statement that has a result set is an
+error as well, not a statement without rows.
+---
+ mysql/driver.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/mysql/driver.c b/mysql/driver.c
+index a55b28f..0697759 100755
+--- a/mysql/driver.c
++++ b/mysql/driver.c
+@@ -418,10 +418,23 @@ lua_mysql_execute(struct lua_State *L)
+ 			}
+ 			lua_settable(L, -3);
+ 		}
++		/*
++		 * No result set: either the statement returns none
++		 * (INSERT) or reading it failed.
++		 */
++		if (res == NULL && mysql_field_count(raw_conn) != 0)
++			return lua_mysql_push_error(L, raw_conn);
+ 		/* The counts of the last statement are reported. */
+ 		affected = mysql_affected_rows(raw_conn);
+ 		insert_id = mysql_insert_id(raw_conn);
+ 		int next_res = mysql_next_result(raw_conn);
++		/*
++		 * A positive value is the error of the next statement: the
++		 * earlier ones are done, and the caller must know that
++		 * the rest is not.
++		 */
++		if (next_res > 0)
++			return lua_mysql_push_error(L, raw_conn);
+ 		if (next_res < 0)
+ 			break;
+ 	}

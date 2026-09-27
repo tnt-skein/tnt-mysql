@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Sat, 19 Sep 2026 13:00:00 +0300
+Subject: [PATCH 6/7] driver: fetch prepared values longer than the column
+ length
+
+A buffer for a value of a prepared statement was as long as the length
+the server declared for the column, and a longer value ended the
+result silently: mysql_stmt_fetch returned MYSQL_DATA_TRUNCATED, and
+the loop took any non-zero value for the end. A recursive CTE counting
+to 200 returned 99 rows without an error - the anchor 'select 1'
+declares a column of two characters. An error of the fetch ended the
+result silently the same way.
+
+A buffer starts at most 256 bytes long now - a TEXT or JSON column
+declares gigabytes, and the driver allocated them for every column -
+and grows to the length of a longer value, which is fetched again whole
+with mysql_stmt_fetch_column. An error of the fetch is returned as an
+error. Needs the connector to keep the row fetched on truncation.
+---
+ mysql/driver.c | 69 +++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 63 insertions(+), 6 deletions(-)
+
+diff --git a/mysql/driver.c b/mysql/driver.c
+index 0697759..0b2276c 100755
+--- a/mysql/driver.c
++++ b/mysql/driver.c
+@@ -465,6 +465,43 @@ lua_mysql_stmt_push_row(struct lua_State *L)
+ 	return 1;
+ }
+ 
++/*
++ * The first size of a buffer for a value of a prepared statement.
++ * The length the server declares for a column is a poor size: a
++ * computed column can be longer (an integer of a recursive CTE), and
++ * a TEXT or JSON column declares gigabytes. The buffer starts at most
++ * this long and grows to fit a longer value.
++ */
++#define STMT_BUFFER_START 256
++
++/*
++ * Fetch again the values of the current row that did not fit their
++ * buffers: grow each such buffer to the length of its value, fetch
++ * the value whole and bind the grown buffers for the next rows.
++ *
++ * Returns 0 on success, 1 on an error of the statement and -1 if
++ * there is no memory for a buffer.
++ */
++static int
++lua_mysql_stmt_fetch_long(MYSQL_STMT *stmt, MYSQL_BIND *binds,
++			  unsigned long col_count)
++{
++	unsigned long col_no;
++	for (col_no = 0; col_no < col_count; ++col_no) {
++		MYSQL_BIND *bind = binds + col_no;
++		if (*bind->is_null || *bind->length <= bind->buffer_length)
++			continue;
++		char *buffer = (char *) realloc(bind->buffer, *bind->length);
++		if (buffer == NULL)
++			return -1;
++		bind->buffer = buffer;
++		bind->buffer_length = *bind->length;
++		if (mysql_stmt_fetch_column(stmt, bind, col_no, 0) != 0)
++			return 1;
++	}
++	return mysql_stmt_bind_result(stmt, binds) != 0;
++}
++
+ /*
+  * Execute sql statement as prepared statement with params
+  */
+@@ -549,10 +586,12 @@ lua_mysql_execute_prepared(struct lua_State *L)
+ 	MYSQL_FIELD *fields = mysql_fetch_fields(meta);
+ 	unsigned long col_no;
+ 	for (col_no = 0; col_no < col_count; ++col_no) {
++		unsigned long size = fields[col_no].length;
++		if (size == 0 || size > STMT_BUFFER_START)
++			size = STMT_BUFFER_START;
+ 		result_binds[col_no].buffer_type = MYSQL_TYPE_STRING;
+-		result_binds[col_no].buffer =
+-			(char *) malloc(fields[col_no].length);
+-		result_binds[col_no].buffer_length = fields[col_no].length;
++		result_binds[col_no].buffer = (char *) malloc(size);
++		result_binds[col_no].buffer_length = size;
+ 		result_binds[col_no].length = (unsigned long *) malloc(
+ 			sizeof(unsigned long));
+ 		result_binds[col_no].is_null = (my_bool *) malloc(
+@@ -563,9 +602,24 @@ lua_mysql_execute_prepared(struct lua_State *L)
+ 	lua_newtable(L);
+ 	unsigned int row_idx = 1;
+ 	while (true) {
+-		int has_no_row = mysql_stmt_fetch(stmt);
+-		if (has_no_row)
++		int fetched = mysql_stmt_fetch(stmt);
++		if (fetched == MYSQL_NO_DATA)
+ 			break;
++		/*
++		 * A value longer than its buffer used to end the result
++		 * silently: 99 rows of 200 came without an error.
++		 */
++		if (fetched == MYSQL_DATA_TRUNCATED)
++			fetched = lua_mysql_stmt_fetch_long(stmt, result_binds,
++							    col_count);
++		/*
++		 * An error used to end the result silently too; -1 is
++		 * no memory for a buffer.
++		 */
++		if (fetched != 0) {
++			error = fetched;
++			goto done;
++		}
+ 		lua_pushnumber(L, row_idx);
+ 		lua_pushcfunction(L, lua_mysql_stmt_push_row);
+ 		lua_pushnumber(L, col_count);
+@@ -580,7 +634,10 @@ lua_mysql_execute_prepared(struct lua_State *L)
+ 	lua_settable(L, -3);
+ 
+ done:
+-	if (error)
++	if (error < 0)
++		ret_count = lua_mysql_push_error_of(L, CR_OUT_OF_MEMORY,
++			"Can not allocate memory for a column value");
++	else if (error)
+ 		ret_count = lua_mysql_push_stmt_error(L, conn->raw_conn, stmt);
+ 	else if (!fail)
+ 		ret_count += lua_mysql_push_counts(L, affected, insert_id);

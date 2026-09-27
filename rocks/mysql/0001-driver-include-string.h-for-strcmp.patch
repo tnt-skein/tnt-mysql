@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Sat, 19 Sep 2026 13:00:00 +0300
+Subject: [PATCH 1/7] driver: include string.h for strcmp
+
+lua_mysql_connect calls strcmp without the header. Clang 16 and newer
+treat an implicit function declaration as an error: 'call to
+undeclared library function strcmp', and the rock did not build
+without -Wno-error=implicit-function-declaration.
+---
+ mysql/driver.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/mysql/driver.c b/mysql/driver.c
+index 05dcde8..ca84296 100755
+--- a/mysql/driver.c
++++ b/mysql/driver.c
+@@ -31,6 +31,7 @@
+ #include <stddef.h>
+ #include <assert.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <errno.h>
+ 
+ #include <lua.h>

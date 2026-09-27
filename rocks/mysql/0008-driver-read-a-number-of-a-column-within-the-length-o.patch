@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Sun, 27 Sep 2026 09:00:00 +0300
+Subject: [PATCH 8/8] driver: read a number of a column within the length of its
+ value
+
+A number of a column was read by strtod and strtoll, which stop at
+the first character that is not a part of the number and do not know
+the length of the value. A value of the text protocol ends with NUL,
+and a value of a prepared statement ends with NUL only if it is
+shorter than its buffer: the connector writes NUL behind the value
+only when there is room for it. A value as long as its buffer was
+read together with the bytes behind the buffer. A recursive CTE
+counting to 200 returned 2003, 2004 or 2006 for 200 now and then: the
+buffer grown to three bytes for 100 holds 200 whole, and the byte
+behind it was a digit left in the heap. A value as long as the length
+the server declares for a column - -2147483648 in an INT column,
+18446744073709551615 in a BIGINT UNSIGNED - was read the same way.
+
+A number is read from a copy of the value that ends with NUL: on the
+stack, or on the heap for a text longer than 63 characters.
+---
+ mysql/driver.c | 64 +++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 45 insertions(+), 19 deletions(-)
+
+diff --git a/mysql/driver.c b/mysql/driver.c
+index a500200..e473c38 100755
+--- a/mysql/driver.c
++++ b/mysql/driver.c
+@@ -230,6 +230,48 @@ lua_mysql_field_type_to_string(enum enum_field_types type)
+ 	return mysql_field_type_strs[hash];
+ }
+ 
++/*
++ * The size of a copy of a number on the stack; a longer text - a
++ * DOUBLE(255, 30) - is copied to the heap.
++ */
++#define NUMBER_TEXT_SMALL 64
++
++/*
++ * Push the number of a column: a double for the types up to DOUBLE,
++ * an int64 or a uint64 for a BIGINT.
++ *
++ * The text is read from a copy of `len` bytes that ends with NUL. A
++ * value of a prepared statement ends with NUL only if it is shorter
++ * than its buffer, and a value as long as its buffer - -2147483648 in
++ * an INT column, 200 in a buffer grown for 100 - was read together
++ * with the bytes behind the buffer: 200 came as 2003 or 2006.
++ */
++static void
++lua_mysql_push_number(struct lua_State *L, MYSQL_FIELD *field,
++		      const char *data, unsigned long len)
++{
++	char small[NUMBER_TEXT_SMALL];
++	char *text = len < sizeof(small) ? small : (char *) malloc(len + 1);
++	if (text == NULL) {
++		luaL_error(L, "Can not allocate memory for a number value");
++		return;
++	}
++	memcpy(text, data, len);
++	text[len] = '\0';
++	/*
++	 * An unsigned value is read as unsigned: atoll stops at 2^63 - 1,
++	 * and 18446744073709551615 came as 9223372036854775807.
++	 */
++	if (field->type != MYSQL_TYPE_LONGLONG)
++		lua_pushnumber(L, strtod(text, NULL));
++	else if (field->flags & UNSIGNED_FLAG)
++		luaL_pushuint64(L, strtoull(text, NULL, 10));
++	else
++		luaL_pushint64(L, strtoll(text, NULL, 10));
++	if (text != small)
++		free(text);
++}
++
+ /**
+  * Push value retrieved from mysql field to lua stack.
+  *
+@@ -258,12 +300,10 @@ lua_mysql_push_value(struct lua_State *L, MYSQL_FIELD *field, void *data,
+ 		case MYSQL_TYPE_LONG:
+ 		case MYSQL_TYPE_FLOAT:
+ 		case MYSQL_TYPE_INT24:
+-		case MYSQL_TYPE_DOUBLE: {
+-			char *data_end = data + len;;
+-			double v = strtod(data, &data_end);
+-			lua_pushnumber(L, v);
++		case MYSQL_TYPE_DOUBLE:
++		case MYSQL_TYPE_LONGLONG:
++			lua_mysql_push_number(L, field, data, len);
+ 			break;
+-		}
+ 
+ 		case MYSQL_TYPE_NULL:
+ 			if (keep_null == 1)
+@@ -272,20 +312,6 @@ lua_mysql_push_value(struct lua_State *L, MYSQL_FIELD *field, void *data,
+ 				lua_pushnil(L);
+ 			break;
+ 
+-		case MYSQL_TYPE_LONGLONG: {
+-				/*
+-				 * An unsigned value is read as unsigned: atoll
+-				 * stops at 2^63 - 1, and 18446744073709551615
+-				 * came as 9223372036854775807.
+-				 */
+-				if (field->flags & UNSIGNED_FLAG) {
+-					luaL_pushuint64(L, strtoull(data, NULL, 10));
+-				} else {
+-					luaL_pushint64(L, strtoll(data, NULL, 10));
+-				}
+-				break;
+-		}
+-
+ 		/* AS string */
+ 		case MYSQL_TYPE_NEWDECIMAL:
+ 		case MYSQL_TYPE_DECIMAL:
+-- 
+2.47.3
+
